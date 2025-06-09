@@ -1,67 +1,98 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import sounddevice as sd
+import speech_recognition as sr
+import tempfile
 
-# Load your Shakes Unified Tactemes CSV
-file_path = 'shakes_unified_tactemes_310.csv'
-shakes_df = pd.read_csv(file_path)
+# Load your cleaned core mora dataset
+@st.cache_data
+def load_moras():
+    df = pd.read_csv("shakes_core_moras.csv")
+    return {
+        row["Romaji"]: row["Rhythmic Pattern"]
+        for _, row in df.iterrows()
+    }
 
-# Define buzz durations for each rhythm symbol
-rhythm_to_buzz = {
+# Map rhythm symbols to vibration duration in ms
+rhythm_to_duration = {
     "s": 100,
     "ŝ": 130,
-    "S": 180,
     "m": 150,
-    "ḿ": 170
+    "ḿ": 170,
+    "S": 180,
+    "Ś": 200
 }
-
-def pattern_to_durations(pattern):
-    tokens = pattern.split('-')
-    durations = []
-    for token in tokens:
-        if token in rhythm_to_buzz:
-            durations.append((token, rhythm_to_buzz[token]))
-    return durations
 
 def text_to_moras(text):
     text = text.lower().replace(".", "").replace(",", "")
-    words = text.split()
-    moras = []
-    for word in words:
-        i = 0
-        while i < len(word):
-            mora = word[i:i+2]
-            moras.append(mora)
-            i += 2
-    return moras
+    return [text[i:i+2] for i in range(0, len(text), 2)]
 
-def moras_to_patterns(moras, df):
-    pattern_list = []
-    for mora in moras:
-        match = df[df['Romaji'] == mora]
-        if not match.empty:
-            pattern = match.iloc[0]['Rhythmic Pattern']
-            durations = pattern_to_durations(pattern)
-            pattern_list.append((mora, durations))
+def pattern_to_sequence(pattern):
+    parts = pattern.split("-")
+    return [(tone, rhythm_to_duration.get(tone, 100)) for tone in parts]
+
+def play_pattern(sequence):
+    fs = 44100  # Sample rate
+    for tone, duration in sequence:
+        if tone in rhythm_to_duration:
+            t = duration / 1000
+            f = 70  # frequency for buzz simulation
+            samples = (np.sin(2 * np.pi * np.arange(fs * t) * f / fs)).astype(np.float32)
+            sd.play(samples, samplerate=fs)
+            sd.wait()
         else:
-            pattern_list.append((mora, [("pause", 100)]))
-    return pattern_list
+            sd.stop()
+            sd.sleep(int(duration))
+
+# Speech to text using microphone
+@st.cache_resource
+def get_recognizer():
+    return sr.Recognizer()
+
+def recognize_speech():
+    r = get_recognizer()
+    with sr.Microphone() as source:
+        st.info("Listening...")
+        audio = r.listen(source)
+        try:
+            return r.recognize_google(audio)
+        except sr.UnknownValueError:
+            return ""
+        except sr.RequestError:
+            return "[API unavailable]"
 
 # Streamlit UI
-st.title("Shakes MVP: Text to Vibration Pattern")
+st.set_page_config(page_title="Shakes Translator", layout="centered")
+st.title("🧠 Shakes Language Translator")
 
-text_input = st.text_input("Enter text to translate into Shakes:")
+mora_map = load_moras()
 
-if st.button("Translate"):
-    if text_input.strip():
-        moras = text_to_moras(text_input)
-        st.subheader("Detected Moras")
-        st.write(moras)
+# Chat-like container
+st.write("### Type or speak below:")
 
-        shake_patterns = moras_to_patterns(moras, shakes_df)
+col1, col2 = st.columns([4, 1])
+with col1:
+    user_input = st.text_input("Your message", placeholder="Type here or use mic...")
+with col2:
+    if st.button("🎙️"):
+        user_input = recognize_speech()
+        st.session_state["transcript"] = user_input
 
-        st.subheader("Shakes Vibration Patterns")
-        for mora, pattern in shake_patterns:
-            pattern_str = ", ".join([f"{buzz} ({dur}ms)" for buzz, dur in pattern])
-            st.write(f"**{mora}** → {pattern_str}")
-    else:
-        st.warning("Please enter some text.")
+if "transcript" in st.session_state and not user_input:
+    user_input = st.session_state["transcript"]
+    st.text_input("Your message", value=user_input, key="final_input")
+
+if user_input:
+    moras = text_to_moras(user_input)
+    st.markdown("---")
+    st.write("#### Shakes Output")
+    for mora in moras:
+        pattern = mora_map.get(mora)
+        if pattern:
+            st.write(f"`{mora}` → {pattern}")
+            sequence = pattern_to_sequence(pattern)
+            if st.button(f"▶️ Play `{mora}`"):
+                play_pattern(sequence)
+        else:
+            st.warning(f"No pattern found for '{mora}'")
